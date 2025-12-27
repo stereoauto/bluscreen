@@ -18,6 +18,10 @@ It is recommended that your player is set up with a static IP address so you
 don't have to keep finding the player IP manually. Your player's IP address
 can be found in the Bluesound client software under 'Help -> Diagnostics'.
 
+Just a note - this has mainly been tested with local libraries and with Amazon Music, Radio
+Paradise, and TuneIn. I am not currently using other services such as Spotify, Tidal,
+Qobuz, etc.
+
 This program uses the Bluesound custom integration API that is described
 here: https://bluos.io/wp-content/uploads/2025/06/BluOS-Custom-Integration-API_v1.7.pdf
 
@@ -26,4 +30,5 @@ Lenbrook or Bluesound.
 
 This program is not perfect - improvements are welcome. I am fairly new to github so any suggestions
 to make this repo more useful wold be appreciated. Have fun!
+
 
