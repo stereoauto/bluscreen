@@ -6,7 +6,7 @@ Quick start:
  - you may need to select a new font for the display base don your platform of choice. By
    default this uses 'Century Gothic' but this is not available everywhere, for a
    Raspberry Pi deployment I was using FreeSans
- - run the display using 'python3 bluescreen.pyw --player_ip #.#.#.#'
+ - run the display using 'python3 bluscreen.pyw --player_ip #.#.#.#'
 
 While the display is running:
  - 'Esc' will quit the display
@@ -26,3 +26,4 @@ Lenbrook or Bluesound.
 
 This program is not perfect - improvements are welcome. I am fairly new to github so any suggestions
 to make this repo more useful wold be appreciated. Have fun!
+
