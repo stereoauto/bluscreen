@@ -1,9 +1,9 @@
 Bluscreen is an 'across the room' now-playing display for Bluesound players.
 
 Quick start:
- - Clone this repo
+ - Clone or download this repo
  - add any missing Python modules (likely just pygame and requests)
- - you may need to select a new font for the display base don your platform of choice. By
+ - you may need to select a new font for the display based on your platform of choice. By
    default this uses 'Century Gothic' but this is not available everywhere, for a
    Raspberry Pi deployment I was using FreeSans
  - run the display using 'python3 bluscreen.pyw --player_ip #.#.#.#'
@@ -22,13 +22,15 @@ Just a note - this has mainly been tested with local libraries and with Amazon M
 Paradise, and TuneIn. I am not currently using other services such as Spotify, Tidal,
 Qobuz, etc.
 
+This video shows some album art/title transitions when cycling through some tracks
+from Amazon Music: https://www.youtube.com/watch?v=MRHg25M8rgg
+Note that titles that are wider than the screen scroll more slowly and will
+repeat the scrolling during the track's duration.
+
 This program uses the Bluesound custom integration API that is described
 here: https://bluos.io/wp-content/uploads/2025/06/BluOS-Custom-Integration-API_v1.7.pdf
 
-This program works with the BluOS ecosystem, it is not an official product of
-Lenbrook or Bluesound.
+Bluscreen works with the BluOS ecosystem, it is not an official product of Lenbrook or Bluesound.
 
 This program is not perfect - improvements are welcome. I am fairly new to github so any suggestions
 to make this repo more useful wold be appreciated. Have fun!
-
-
