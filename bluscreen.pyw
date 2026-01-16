@@ -3,6 +3,7 @@ from pygame.locals import *
 import requests
 import argparse
 from threading import Thread, Lock
+from animatable import Animatable, TargetXLocation
 import sys
 import os
 import io
@@ -13,50 +14,51 @@ from xml.etree import ElementTree
 # (skip fwd) and volume control via the keyboard. See README.txt for more
 # details.
 
+# The port that Bluesound uses for its control API
 BLUPORT = 11000
 
 class NowPlaying:
+    # This minimalist 'Now Playing' display has 3 elements that are animated:
+    #   - an album image
+    #   - a line1 string
+    #   - a line2 string
+    # Each has a current and previous value
+    # There is also a static 'service' graphic that shows the current
+    # music serivce, this is displayed in the bottom right corner.
 
-    # This class has two sets of info, 'current' and 'prev'.
-    # When the current track is updated, the old values are
-    # copied to 'prev' and then scrolled off the screen.
-
+    # Reset the current info parameters
     def resetCurrent(self):
-        self.currImageSurface = None
         self.currImageBytes = None
-        self.currImageX = None
-        self.currImageY = None
+        self.imageUrl = None
+        self.serviceUrl = None
+        self.serviceSurface = None
         self.currLine1 = None
-        self.currLine1X = None
         self.currLine2 = None
-        self.currLine2X = None
-        self.currLine1Surface = None
-        self.currLine2Surface = None
 
+    # Reset the previous info parameters
     def resetPrev(self):
-        self.prevImageSurface = None
         self.prevImageBytes = None
-        self.prevImageY = None
-        self.prevImageX = None
         self.prevLine1 = None
-        self.prevLine1X = None
         self.prevLine2 = None
-        self.prevLine1Surface = None
-        self.prevLine2Surface = None
 
     # Set up defaults and calculate font size
-    def __init__(self, addr, port, screen):
+    def __init__(self, addr, port, screen, fontName):
+        # basic params - IP address, port and screen instance
         self.ipaddr = addr
         self.port = port
         self.pygameScreen = screen
-        self.scrollfactor = 0
 
+        # We keep a dict of animatable objects that we need to update
+        self.animObjects = {}
+
+        # init our current and previous data
         self.resetCurrent()
         self.resetPrev()
 
         # Mutex for swapping current/previous data
         self.mutex = Lock()
 
+        # grab our working screen size
         self.screenW, self.screenH = self.pygameScreen.get_size()
 
         # The two lines of track info should take up about 40% of the screen,
@@ -72,7 +74,7 @@ class NowPlaying:
         self.fontSize = int(self.textHeight / 1.3333)
 
         # Finally, allocate the appropriately sized font
-        self.myFont = pygame.font.SysFont('Century Gothic', self.fontSize)
+        self.myFont = pygame.font.SysFont(fontName, self.fontSize)
 
     # Skip ahead to the next track
     def skip(self):
@@ -123,6 +125,60 @@ class NowPlaying:
 
         return
 
+    # Do the necessary URL translation to fetch the specified image URL bytes.
+    # An img URL can be relative to the Bluesound API or a standalone URL
+    def fetchImgContents(self, imgUrl):
+        # Sometimes the image info is a relative URL based on the Bluesound player's
+        # http address, and other times it is a standalone URL that references some
+        # other site.
+        url = f"http://{self.ipaddr}:{self.port}/{imgUrl}"
+        # If the image URL starts with http: or https: then it is standalone
+        if imgUrl.startswith('https:') or imgUrl.startswith('http:'):
+            url = imgUrl
+        response = requests.get(url)
+        if response.status_code == 200:
+            return response.content
+        else:
+            return None
+
+    # Utility method to query the current player status and fetch any album art
+    # and service icons
+    def queryStatus(self):
+        # These are the fields that we're looking for in the returned XML
+        # (plus some derived fields)
+        info = { 'album': None, 'artist': None, 'image': None, 'name': None,
+             'twoline_title1': None, 'twoline_title2': None, 'serviceName': None,
+             'serviceIcon': None, 'streamFormat': None, 'currentImageBytes': None,
+             'currentServiceBytes': None }
+
+        # get the player 'Status'
+        try:
+            response = requests.get(f"http://{self.ipaddr}:{self.port}/Status", timeout=2)
+            if response.status_code != 200:
+                info['twoline_title1'] = f'Bad status response code: {response.status_code}'
+                return info
+        except requests.exceptions.ConnectTimeout:
+            info['twoline_title1'] = 'Timeout connecting to player'
+            return info
+
+        # If we get here, then the request was successful. Parse the XML from the Bluesound
+        # player's response
+        tree = ElementTree.fromstring(response.content)
+
+        # Copy any fields that we want from the XML into the above dict
+        for child in tree:
+            if child.tag in info:
+                info[child.tag] = child.text
+
+        return info
+
+    # Take an image surface and rescale it to be a specified height
+    def scaleImageForHeight(self, imgSurface, newHeight):
+        p_width, p_height = imgSurface.get_size()
+        ratio = newHeight / p_height
+        newWidth = int(p_width * ratio)
+        return pygame.transform.smoothscale(imgSurface, (newWidth, newHeight))
+
     # do the query to the Bluesound player and track any changes since
     # the last query. This runs in a separate thread and uses a mutex when
     # updating the instance variables.
@@ -132,85 +188,66 @@ class NowPlaying:
         line1Changed = False
         line2Changed = False
 
-        # New surfaces
+        # New surfaces/values
         newImageSurface = None
         newImageBytes = None
         newLine1Surface = None
         newLine1Value = None
         newLine2Surface = None
         newLine2Value = None
+        newServiceSurface = None
 
-        try:
-            response = requests.get(f"http://{self.ipaddr}:{self.port}/Status", timeout=2)
-            if response.status_code != 200:
-                print(f"Bad return status: {response.status_code}")
-                sys.exit(1)
-        except requests.exceptions.ConnectTimeout:
-            # self.resetCurrent()
-            newLine1Value = "Timeout getting status (press 'Esc' to exit)"
-            newLine1Surface = self.myFont.render(newLine1Value, False, (255, 255, 255))
-            with self.mutex:
-                # We could not get a response, so update the 'current' info
-                # with the above help text and fail out
-                if self.currLine1 != newLine1Value:
-                    self.prevLine1 = self.currLine1
-                    self.prevLine1Surface = self.currLine1Surface
-                    self.prevLine1X = self.currLine1X
-                    self.currLine1 = newLine1Value
-                    self.currLine1Surface = newLine1Surface
-                    self.currLine1X = self.screenW + 50
-                    self.currImageSurface = None
-                    self.currLine2Surface = None
-            return
+        # Defaults for animation
+        # Speed for new items to scroll in from the right hand side
+        newSpeed = 5
+        # Speed for 'killed' items to scroll from the center to off the left hand side
+        killSpeed = 12
 
-        # Grab the XML from the Bluesound player's response
-        tree = ElementTree.fromstring(response.content)
+        # Our line 1 and line 2 Y values
+        line1Y = self.screenH - (self.textHeight * 3)
+        line2Y = self.screenH - (self.textHeight * 2)
 
-        # These are the fields that we're looking for in the XML
-        info = { 'album': None, 'artist': None, 'image': None, 'name': None,
-             'twoline_title1': None, 'twoline_title2': None, 'serviceName': None }
+        # Query the player status
+        info = self.queryStatus()
 
-        # Copy any fields that we want from the XML into the above dict
-        for child in tree:
-            if child.tag in info:
-                info[child.tag] = child.text
-
-        # Check the image URL
-        if info['image'] != None:
-            # Sometimes the image info is a relative URL based on the Bluesound player's
-            # http address, and other times it is a standalone URL that references some
-            # other site.
-            imgUrl = f"http://{self.ipaddr}:{self.port}/{info['image']}"
-            # If the image URL starts with http: or https: then it is standalone
-            if info['image'].startswith('https:') or info['image'].startswith('http:'):
-                imgUrl = info['image']
-            response = requests.get(imgUrl)
-            if response.status_code != 200:
-                # print(f"Bad return status: {response.status_code}")
-                # print(f"URL: {imgUrl}")
-                self.currImageSurface = None
-            else:
+        # See if the image has updated, if it has then we create
+        # a new pygame surface for it.
+        if info['image'] != self.imageUrl:
+            imageChanged = True
+            info['currentImageBytes'] = self.fetchImgContents(info['image'])
+            if info['currentImageBytes'] != None:
+                image_file_like = io.BytesIO(info['currentImageBytes'])
                 try:
-                    # Treat the bytes like a file
-                    image_file_like = io.BytesIO(response.content)
+                    # image sizes vary, scale this one to fit our image area on the display
+                    imageHeight = int(self.screenH * 0.6) - 100
 
-                    # See if the image has updated, if it has then we create
-                    # a new pygame surface for it.
-                    if response.content != self.currImageBytes:
-                        imageChanged = True
-                        newImageSurface = pygame.image.load(image_file_like)
-                        newImageBytes = response.content
-                        p_width, p_height = newImageSurface.get_size()
-
-                        # image sizes vary, scale this one to fit our image area on the display
-                        imageHeight = int(self.screenH * 0.6) - 100
-
-                        ratio = imageHeight / p_height
-                        newWidth = int(p_width * ratio)
-                        newImageSurface = pygame.transform.smoothscale(newImageSurface, (newWidth, imageHeight))
-
+                    newImageSurface = pygame.image.load(image_file_like)
+                    newImageBytes = info['currentImageBytes']
+                    newImageSurface = self.scaleImageForHeight(newImageSurface, imageHeight)
                 except Exception as e:
-                    print(f"Failed to load image: {e}")
+                    # Give up, don't display an image
+                    newImageSurface = None
+
+        # currentServiceBytes should be an icon that shows the current music service
+        # (like Amazon, Qobuz, Tidal, etc.)
+        if info['serviceIcon'] != self.serviceUrl:
+            if info['serviceIcon'] != None:
+                try:
+                    info['currentServiceBytes'] = self.fetchImgContents(info['serviceIcon'])
+                    # Treat the bytes like a file
+                    image_file_like = io.BytesIO(info['currentServiceBytes'])
+                    newServiceSurface = pygame.image.load(image_file_like)
+                    # image sizes vary, scale this one to fit our image area on the display
+                    imageHeight = self.fontSize
+                    newServiceSurface = self.scaleImageForHeight(newServiceSurface, self.fontSize)
+                    self.serviceUrl = info['serviceIcon']
+                except Exception as e:
+                    # Give up, don't display a service image
+                    newServiceSurface = None
+            else:
+                newServiceSurface = None
+        else:
+            newServiceSurface = self.serviceSurface
 
         # Check the first text line to see if it has changed.
         if info['twoline_title1'] != None and info['twoline_title1'] != self.currLine1:
@@ -225,7 +262,7 @@ class NowPlaying:
                 newLine2Value = info['twoline_title2']
                 newLine2Surface = self.myFont.render(newLine2Value, False, (255, 255, 255))
         else:
-            # Special case - if nothing is playing, title1 is null.
+            # Special case - if nothing is playing, title2 is null.
             newLine1Value = 'Play queue is empty'
             if self.currLine1 != newLine1Value:
                 line1Changed = True
@@ -240,122 +277,107 @@ class NowPlaying:
         # and previous values so we don't change them partway though a display refresh
         with self.mutex:
             if imageChanged:
-                self.prevImageSurface = self.currImageSurface
-                self.prevImageX = self.currImageX
-                self.prevImageY = self.currImageY
-                self.prevImageBytes = self.currImageBytes
+                # if we have a current image, kill it
+                if 'currImage' in self.animObjects:
+                    self.animObjects['prevImage'] = self.animObjects['currImage']
+                    self.animObjects['prevImage'].kill()
+                    self.animObjects['prevImage'].set_speed(killSpeed)
+                    del self.animObjects['currImage']
+
+                # if we have a new image, create an animatable to handle it - new images
+                # start off the screen to the right then animate to the center
+                if newImageSurface != None:
+                    # create a new animatable for this image, stop when img is centered
+                    newImageAnim = Animatable(newImageSurface, self.screenW + 100,
+                                              TargetXLocation.CENTERED, 50, newSpeed, loop=False)
+                    self.animObjects['currImage'] = newImageAnim
+                # keep a copy of our current image url and bytes so we can track when the image
+                # changes
                 self.currImageBytes = newImageBytes
-                self.currImageSurface = newImageSurface
-                self.currImageY = 50
-                self.currImageX = self.screenW + 100
+                self.imageUrl = info['image']
+
             if line1Changed:
-                self.prevLine1 = self.currLine1
-                self.prevLine1Surface = self.currLine1Surface
-                self.prevLine1X = self.currLine1X
+                if 'currLine1' in self.animObjects:
+                    self.animObjects['prevLine1'] = self.animObjects['currLine1']
+                    self.animObjects['prevLine1'].kill()
+                    self.animObjects['prevLine1'].set_speed(killSpeed)
+                    del self.animObjects['currLine1']
+
+                if newLine1Value != None:
+                    w, h = newLine1Surface.get_size()
+                    loop = (w > self.screenW)
+
+                    # create a new animatable for this image
+                    newLine1Anim = Animatable(newLine1Surface, self.screenW + 150,
+                                              TargetXLocation.CENTERED, line1Y, newSpeed, loop=loop)
+                    self.animObjects['currLine1'] = newLine1Anim
+
                 self.currLine1 = newLine1Value
-                self.currLine1Surface = newLine1Surface
-                self.currLine1X = self.screenW + 150
+
             if line2Changed:
-                self.prevLine2 = self.currLine2
-                self.prevLine2Surface = self.currLine2Surface
-                self.prevLine2X = self.currLine2X
+                if 'currLine2' in self.animObjects:
+                    self.animObjects['prevLine2'] = self.animObjects['currLine2']
+                    self.animObjects['prevLine2'].kill()
+                    self.animObjects['prevLine2'].set_speed(killSpeed)
+                    del self.animObjects['currLine2']
+
+                if newLine2Value != None:
+                    w, h = newLine2Surface.get_size()
+                    loop = (w > self.screenW)
+
+                    # create a new animatable for this image
+                    newLine2Anim = Animatable(newLine2Surface, self.screenW + 100,
+                                              TargetXLocation.CENTERED, line2Y, newSpeed, loop=loop)
+                    self.animObjects['currLine2'] = newLine2Anim
+
                 self.currLine2 = newLine2Value
-                self.currLine2Surface = newLine2Surface
-                self.currLine2X = self.screenW + 10
+
+            # the service icon is not animated, it is directly replaced when changed
+            self.serviceSurface = newServiceSurface
+            if newServiceSurface != None:
+                w1, h1 = newServiceSurface.get_size()
+                newServiceAnim = Animatable(newServiceSurface, self.screenW - (w1 + 20),
+                                            TargetXLocation.RIGHT, self.screenH - (h1 + 10), 0, loop=False)
+                self.animObjects['currService'] = newServiceAnim
+            else:
+                if 'currService' in self.animObjects:
+                    del self.animObjects['currService']
         return
 
     # This 'animate' method will move the current and previous images and
     # text lines from their current position to their target positions.
     def animate(self):
-        s_middle = self.screenW // 2
-        # play with these two values if your display is too fast/slow. The
-        # 'speed' affects how quickly shorter lines are moved ont he screen,
-        # and 'scroll_slowdown' affects how much more slowly the longer text
-        # lines scroll (ones that are wider than the screen)
-        speed = 6
-        scroll_slowdown = 2
-
-
-        # Figure out our y values for our 2 lines and the image
-        line1Y = self.screenH - (self.textHeight * 3)
-        line2Y = self.screenH - (self.textHeight * 2)
-        self.scrollfactor += 1
-
         with self.mutex:
+            # background: paint it black
             self.pygameScreen.fill((0, 0, 0))
-            if self.currImageSurface != None:
-                w1, h1 = self.currImageSurface.get_size()
-                self.pygameScreen.blit(self.currImageSurface, (self.currImageX, self.currImageY))
-                if self.currImageX > s_middle - (w1 // 2):
-                    self.currImageX -= speed
 
-            # Scroll the previous image off the screen if needed
-            if self.prevImageSurface != None:
-                w1, h1 = self.prevImageSurface.get_size()
-                self.pygameScreen.blit(self.prevImageSurface, (self.prevImageX, self.prevImageY))
-                if self.prevImageX > -(w1 + 10):
-                    self.prevImageX -= speed * 3
-
-
-            # The text lines start off the right hand side of the screen and end up centered.
-            # Lines that are longer than the width of the screen are scrolled more slowly
-            if self.currLine1Surface != None:
-                w1, h1 = self.currLine1Surface.get_size()
-                self.pygameScreen.blit(self.currLine1Surface, (self.currLine1X, line1Y))
-                if w1 > self.screenW:
-                    if self.currLine1X > - (w1):
-                        if self.scrollfactor % scroll_slowdown == 0:
-                            self.currLine1X -= speed
-                    else:
-                        self.currLine1X = self.screenW
-                else:
-                    if self.currLine1X > s_middle - (w1 // 2):
-                        self.currLine1X -= speed
-
-            # The previous text lines start out centered, then scroll off quickly to the
-            # left hand side of the screen.
-            if self.prevLine1Surface != None:
-                w1, h1 = self.prevLine1Surface.get_size()
-                self.pygameScreen.blit(self.prevLine1Surface, (self.prevLine1X, line1Y))
-                if self.prevLine1X > - (w1):
-                    self.prevLine1X -= speed * 3
-
-           # Like the line 1 surfaces, line 2 starts to the right of the screen and ands
-           # up centered for shorter lines, and are scrolled more slowly for longer lines.
-            if self.currLine2Surface != None:
-                w1, h1 = self.currLine2Surface.get_size()
-                self.pygameScreen.blit(self.currLine2Surface, (self.currLine2X, line2Y))
-                if w1 > self.screenW:
-
-                    # Check if the line has scrolled off the screen and reset at right if so
-                    if self.currLine2X > - (w1):
-                        if self.scrollfactor % scroll_slowdown == 0:
-                            self.currLine2X -= speed
-                    else:
-                        # reset X position to far right of screen
-                        self.currLine2X = self.screenW
-                else:
-                    if self.currLine2X > s_middle - (w1 // 2):
-                        self.currLine2X -= speed
-
-            if self.prevLine2Surface != None:
-                w1, h1 = self.prevLine2Surface.get_size()
-                self.pygameScreen.blit(self.prevLine2Surface, (self.prevLine2X, line2Y))
-                if self.prevLine2X > -(w1 + 10):
-                    self.prevLine2X -= speed * 3
+            # step though our dict of animatables and remove any that have scrolled off the screen
+            delKeys = []
+            for k, v in self.animObjects.items():
+                remove = v.animate(self.pygameScreen)
+                if remove:
+                    delKeys.append(k)
+            # Clean up any items that have scrolled off the screen
+            for k in delKeys:
+                if k in self.animObjects:
+                    del self.animObjects[k]
 
 def main():
-
-    playerIp = None
+    # default font for Windows - if a font is not found, the default system font is used.
+    fontName = 'Century Gothic'
 
     # Parse args
     parser = argparse.ArgumentParser()
     parser.add_argument('--player_ip', dest='player_ip', type=str, help='Player IP address')
+    parser.add_argument('--font', dest='fontName', type=str, help='Font to use for text lines')
     args = parser.parse_args()
 
     if args.player_ip == None:
         print("Missing argument: --player_ip")
         sys.exit(1)
+
+    if args.fontName != None:
+        fontName = args.fontName
 
     # Initialize Pygame - this auto-detects the screen size and sets up
     # a borderless full screen window
@@ -381,10 +403,10 @@ def main():
     mouse_last_moved = pygame.time.get_ticks()
     mouse_visible = True
 
-    # create our NowPLaying object
-    nowPlaying = NowPlaying(args.player_ip, BLUPORT, screen)
+    # create our NowPlaying object
+    nowPlaying = NowPlaying(args.player_ip, BLUPORT, screen, fontName)
 
-    pygame.display.set_caption("BlueScreen")
+    pygame.display.set_caption("Bluscreen")
     pygame.display.set_allow_screensaver(False)
 
     # Display loop
@@ -418,6 +440,7 @@ def main():
                     running = False
             elif event.type == pygame.MOUSEMOTION:
                 mouse_last_moved = current_time
+                # show the mouse again if it was hidden
                 if not mouse_visible:
                     mouse_visible = True
                     pygame.mouse.set_visible(True)
@@ -428,6 +451,7 @@ def main():
 
         # Check for idle time outside the event loop
         if mouse_visible and (current_time - mouse_last_moved) > IDLE_TIME_MS:
+            # hide the mouse
             mouse_visible = False
             pygame.mouse.set_visible(False)
 
@@ -437,7 +461,7 @@ def main():
         # Flip to newly drawn display
         pygame.display.flip()
 
-    # Quit Pygame
+    # We've broken out of the loop - Quit Pygame
     pygame.quit()
 
 if __name__ == "__main__":
